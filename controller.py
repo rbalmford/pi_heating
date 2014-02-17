@@ -5,6 +5,11 @@ import os
 import glob
 import time
 
+# initialise 1-wire sensor
+
+os.system('modprobe w1-gpio')
+os.system('modprobe w1-therm')
+
 # initialise ports
 
 GPIO.setmode(GPIO.BCM)
@@ -29,10 +34,28 @@ GPIO.setup( 7, GPIO.OUT)
 
 GPIO.output(7,0)
 
-# initialise 1-wire sensor
+# GPIO event triggers
 
-os.system('modprobe w1-gpio')
-os.system('modprobe w1-therm')
+def display_temp(temp):
+    GPIO.output(23,((temp & 16) != 0))
+    GPIO.output(22,((temp &  8) != 0))
+    GPIO.output(27,((temp &  4) != 0))
+    GPIO.output(18,((temp &  2) != 0))
+    GPIO.output(17,((temp &  1) != 0))
+
+def cb_tset(channel):  
+    global tset, init
+    init = 1
+    if (channel == 25):
+      tset -= 1
+    elif (channel == 24):
+      tset += 1
+    display_temp(tset)
+
+GPIO.add_event_detect(25, GPIO.FALLING, callback = cb_tset, bouncetime = 250)
+GPIO.add_event_detect(24, GPIO.FALLING, callback = cb_tset, bouncetime = 250)
+
+# initialise 1-wire sensor
 
 w1_base_dir = '/sys/bus/w1/devices/'
 w1_device_folder = glob.glob(w1_base_dir + '28*')[0]
@@ -55,60 +78,50 @@ def read_temp():
         temp_c = float(temp_string) / 1000.0
         return temp_c
 
-def display_temp(temp):
-    GPIO.output(23,((temp & 16) != 0))
-    GPIO.output(22,((temp &  8) != 0))
-    GPIO.output(27,((temp &  4) != 0))
-    GPIO.output(18,((temp &  2) != 0))
-    GPIO.output(17,((temp &  1) != 0))
-
-def cb_tset(channel):  
-    global tset
-    if (channel == 25):
-      tset -= 1
-    elif (channel == 24):
-      tset += 1
-    display_temp(tset)
-
-# GPIO event triggers
-
-GPIO.add_event_detect(25, GPIO.FALLING, callback = cb_tset, bouncetime = 250)
-GPIO.add_event_detect(24, GPIO.FALLING, callback = cb_tset, bouncetime = 250)
-
 # open logfile
 
 log_base_dir  = '/home/pi/logs/'
 log_timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-log_filename  = "".join([log_base_dir, "tlog_", log_timestamp, ".log"])
+log_filename  = "".join([log_base_dir, "tlog_", log_timestamp, ".csv"])
 log_datafile  = open(log_filename, "w", 1)
+
+log_datafile.write("date,time,temp,state,prop,int,power,carry,on\n")
 
 # constants
 
-tset     = 18
-set_bits = 5
-
-cyc_bits = 3
+tset     = 18 # degrees
 tcycle   = 10 # mintes
+
+set_bits = 5
+cyc_bits = 3
 tmeaspc  = 5
 
 cycles   = (1 << cyc_bits) - 1
 tsleep   = float(tcycle) * 60.0 / float(cycles * tmeaspc)
+
+display_temp(tset)
 
 print ""
 print "tcycle:", tcycle, " cycles:", cycles, " tsleep:", tsleep
 
 # variables
 
-count      = tmeaspc - 1
-state      = (2 * cycles) - 1
-tacc       = 0
-erracc     = 0
-intdis     = 1
-
-display_temp(tset)
+init = 1
 
 try:
     while (1):
+        time_1 = time.time()
+
+        if (init):
+            count    = 0
+            state    = (2 * cycles) - 1
+            tacc     = 0
+            erracc   = 0
+            intdis   = 1
+            power    = 0
+            hi_count = 0
+            init     = 0
+
 #         tmeas = 20.5
         tmeas = read_temp()
         tacc  = tacc + tmeas
@@ -116,22 +129,60 @@ try:
 #         print "tmeas:", tmeas,
 #         print " tacc:", tacc
 
-        count = (count + 1) % tmeaspc
-
         if (count == 0):
-            if (state >= cycles):
-                tave = tacc
-            else:
+            if (state < cycles):
                 tave = tacc / float(tmeaspc)
+            else:             # single temp measurement at init
+                tave = tacc
+            tacc = 0
 
             state = (state + 1) % cycles
 
             terror = (tset << (5 + cyc_bits - set_bits)) \
-                     - int(tave * float(1 << cyc_bits))
-            tacc   = 0
+                     - int(tave * 2.0**cyc_bits)
 
-            pprop  = min(cycles,terror)
+# integral path
+
             erracc = erracc + terror
+
+            if (terror > cycles):
+                intdis = 1
+
+            if (state == 0):
+                if (intdis == 1):
+                    pinteg = 0
+                elif (erracc >=  5*cycles): pinteg += 2
+                elif (erracc >=  2*cycles): pinteg += 1
+                elif (erracc <= -5*cycles): pinteg -= 2
+                elif (erracc <= -2*cycles): pinteg -= 1
+                pinteg = min(cycles-1,max(0,pinteg));
+
+# proportional path
+
+            pprop = min(cycles,terror)
+
+            if (state == 0):
+                carry    = min(2,max(-1,power - hi_count))
+                hi_count = 0
+
+# PWM
+
+            power    = carry + pinteg + pprop
+            intbit   = ((carry + pinteg) > state)
+            propbit  = (pprop >= (cycles - state))
+            mask     = (power > hi_count)
+            bit      = (intbit | propbit) & mask
+            hi_count = hi_count + bit
+
+            log_datafile.write(time.strftime('%Y-%m-%d, %H:%M:%S'))
+            log_datafile.write(", " + str(int(tave * 16.0)/16.0))
+            log_datafile.write(", " + str(state))
+            log_datafile.write(", " + str(pprop))
+            log_datafile.write(", " + str(pinteg))
+            log_datafile.write(", " + str(power))
+            log_datafile.write(", " + str(carry))
+            log_datafile.write(", " + str(bit*1))
+            log_datafile.write("\n")
 
             print ""
             print time.strftime('%Y-%m-%d %H:%M:%S')
@@ -140,41 +191,14 @@ try:
             print " tave_f:", tave,
             print " tave_i:", float(int(tave * 16.0)) / 16.0,
             print " terror:", terror
-            print "pprop:", pprop,
-            print " erracc:", erracc,
-
-            if (intdis == 0) & (pprop == cycles):
-                intdis = 1
-
-            if (state == 0):
-                if (intdis == 1):
-                    pinteg = 0
-                elif (erracc >=   5*cycles): pinteg += 2
-                elif (erracc >=   2*cycles): pinteg += 1
-                elif (erracc <=  -5*cycles): pinteg -= 2
-                elif (erracc <=  -2*cycles): pinteg -= 1
-                pinteg = min(cycles-1,max(0,pinteg));
-                erracc = 0
-                intdis = 0
-
-                hi_count = 0
-
-            power    = min(cycles,max(0,pprop + pinteg))
-            bit      = (pinteg > state) | (pprop >= cycles - state);
-            mask     = (power > hi_count);
-            hi_count = hi_count + (bit & mask);
-
-            log_datafile.write(time.strftime('%Y-%m-%d %H-%M-%S'))
-            log_datafile.write(" " + str(tave))
-            log_datafile.write(" " + str(terror))
-            log_datafile.write(" " + str((bit & mask)*1))
-            log_datafile.write("\n")
-
+            print "erracc:",  erracc,
             print " intdis:", intdis,
+            print " carry:",  carry,
             print " pinteg:", pinteg,
-            print " power:", power,
-            print " out:", (bit & mask)*1,
-            print " hi_c:", hi_count
+            print " pprop:",  pprop,
+            print " power:",  power,
+            print " bit:",    bit*1,
+            print " hi_c:",   hi_count
 
             GPIO.output(7,(bit & mask))
 
@@ -184,9 +208,20 @@ try:
             GPIO.output(10,((power & 1) != 0))
             GPIO.output(9,(state == 0))
 
-        time.sleep(tsleep)
+            if (state == 0):
+                erracc = 0
+                intdis = 0
+
+# end of new state section
+
+        count = (count + 1) % tmeaspc
+
+        while ((time.time() - time_1) < tsleep):
+            time.sleep(0.2)
+            if (init):
+                break
 
 except KeyboardInterrupt: # trap a CTRL+C keyboard interrupt
     GPIO.cleanup()        # resets all GPIO ports used by this program
-    log_datafile.close()
+    log_datafile.close()  # close logfile
 
